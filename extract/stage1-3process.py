@@ -17,7 +17,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from extract.chat import chat_infer
-from extract.prompts import prompt_1_semantic_check, prompt_1_title_clean, prompt_2_experiment_check
+from extract.prompts import prompt_1_semantic_check, prompt_1_title_clean, prompt_2_experiment_check, prompt_3_chemistry_check
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,18 +138,55 @@ def stage2_experiment_check(body_text: str, llm_type: str = "gpt-4o") -> Dict[st
         }
 
 
+def stage3_chemistry_check(body_text: str, llm_type: str = "gpt-4o") -> Dict[str, Any]:
+    """
+    第三阶段：判断是否为化学领域（仅对实验步骤使用）
+    
+    Returns:
+        {
+            "is_chemistry": "是" or "否",
+            "reason": "判断理由",
+            "should_delete": bool  # 如果是化学领域，则应该删除发明点
+        }
+    """
+    prompt = prompt_3_chemistry_check.replace("__BODY_TEXT__", body_text)
+    
+    try:
+        response = chat_infer(prompt, LLM_Type=llm_type)
+        result = parse_json_response(response)
+        
+        is_chemistry = result.get("is_chemistry", "否")
+        # 如果是化学领域，则应该删除发明点
+        should_delete = (is_chemistry == "是")
+        
+        return {
+            "is_chemistry": is_chemistry,
+            "reason": result.get("reason", ""),
+            "should_delete": should_delete
+        }
+    except Exception as e:
+        logger.error(f"第三阶段化学领域检查失败: {e}")
+        return {
+            "is_chemistry": "否",
+            "reason": f"处理错误: {e}",
+            "should_delete": False
+        }
+
+
 def process_single_item(item: Dict[str, Any], llm_type: str = "gpt-4o") -> Dict[str, Any]:
     """
-    处理单个知识点/发明点项，完成第一阶段和第二阶段
+    处理单个知识点/发明点项，完成第一阶段、第二阶段和第三阶段
     
     Args:
         item: 包含"原文Reference"的字典项
         
     Returns:
-        简化的处理结果字典，包含：
+        处理结果字典，包含：
         - 原文Reference
         - 清洗后的正文
         - 是否为实验步骤
+        - 是否为化学领域（仅实验步骤时）
+        - 是否为发明点（是/否）
     """
     reference_text = item.get("原文Reference", "")
     
@@ -158,7 +195,8 @@ def process_single_item(item: Dict[str, Any], llm_type: str = "gpt-4o") -> Dict[
             "原文Reference": "",
             "清洗后的正文": "",
             "是否为实验步骤": "否",
-            "状态": "已删除（原文Reference为空）"
+            "是否为化学领域": "",
+            "是否为发明点": "否"
         }
     
     # 第一阶段：语义检查
@@ -169,7 +207,8 @@ def process_single_item(item: Dict[str, Any], llm_type: str = "gpt-4o") -> Dict[
             "原文Reference": reference_text,
             "清洗后的正文": "",
             "是否为实验步骤": "否",
-            "状态": "已删除（不包含正常语义信息）"
+            "是否为化学领域": "",
+            "是否为发明点": "否"
         }
     
     # 第一阶段：标题清洗
@@ -179,11 +218,37 @@ def process_single_item(item: Dict[str, Any], llm_type: str = "gpt-4o") -> Dict[
     stage2_experiment = stage2_experiment_check(body_text, llm_type)
     is_experiment = "是" if stage2_experiment["is_experiment"] == "是" else "否"
     
-    return {
-        "原文Reference": reference_text,
-        "清洗后的正文": body_text,
-        "是否为实验步骤": is_experiment
-    }
+    # 第三阶段：如果是实验步骤，判断是否为化学领域
+    if is_experiment == "是":
+        stage3_chemistry = stage3_chemistry_check(body_text, llm_type)
+        is_chemistry = stage3_chemistry["is_chemistry"]
+        
+        # 如果是化学领域，则删除发明点；如果是机械电学领域，则保留发明点
+        if stage3_chemistry["should_delete"]:
+            return {
+                "原文Reference": reference_text,
+                "清洗后的正文": body_text,
+                "是否为实验步骤": is_experiment,
+                "是否为化学领域": is_chemistry,
+                "是否为发明点": "否"
+            }
+        else:
+            return {
+                "原文Reference": reference_text,
+                "清洗后的正文": body_text,
+                "是否为实验步骤": is_experiment,
+                "是否为化学领域": is_chemistry,
+                "是否为发明点": "是"
+            }
+    else:
+        # 不是实验步骤，暂不处理（后续可能用Prompt_4判断）
+        return {
+            "原文Reference": reference_text,
+            "清洗后的正文": body_text,
+            "是否为实验步骤": is_experiment,
+            "是否为化学领域": "",
+            "是否为发明点": "否"
+        }
 
 
 def process_old_extracted_file(
@@ -253,30 +318,33 @@ def process_old_extracted_file(
     # 保存结果
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(json_path))[0]
-    output_path = os.path.join(output_dir, f"{base_name}_stage12_result.json")
+    output_path = os.path.join(output_dir, f"{base_name}_stage1-3_result.json")
     
     # 统计信息
-    deleted_count = sum(1 for r in results if r.get("状态", "").startswith("已删除"))
-    processed_count = len(results) - deleted_count
+    invention_point_count = sum(1 for r in results if r.get("是否为发明点") == "是")
+    deleted_count = sum(1 for r in results if r.get("是否为发明点") == "否")
     experiment_count = sum(1 for r in results if r.get("是否为实验步骤") == "是")
+    chemistry_count = sum(1 for r in results if r.get("是否为化学领域") == "是")
     
     logger.info(f"保存结果到: {output_path}")
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump({
             "source_file": json_path,
             "total_items": len(results),
+            "invention_point_items": invention_point_count,
             "deleted_items": deleted_count,
-            "processed_items": processed_count,
             "experiment_items": experiment_count,
+            "chemistry_items": chemistry_count,
             "results": results
         }, f, ensure_ascii=False, indent=2)
     
-    logger.info(f"处理完成：总计 {len(results)} 项，已处理 {processed_count} 项，已删除 {deleted_count} 项，实验步骤 {experiment_count} 项")
+    logger.info(f"处理完成：总计 {len(results)} 项，发明点 {invention_point_count} 项，已删除 {deleted_count} 项，实验步骤 {experiment_count} 项，化学领域 {chemistry_count} 项")
     return {
         "total": len(results),
+        "invention_point": invention_point_count,
         "deleted": deleted_count,
-        "processed": processed_count,
         "experiment": experiment_count,
+        "chemistry": chemistry_count,
         "results": results
     }
 
