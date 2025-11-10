@@ -241,13 +241,13 @@ def process_single_item(item: Dict[str, Any], llm_type: str = "gpt-4o") -> Dict[
                 "是否为发明点": "是"
             }
     else:
-        # 不是实验步骤，暂不处理（后续可能用Prompt_4判断）
+        # 不是实验步骤，直接保留为发明点
         return {
             "原文Reference": reference_text,
             "清洗后的正文": body_text,
             "是否为实验步骤": is_experiment,
             "是否为化学领域": "",
-            "是否为发明点": "否"
+            "是否为发明点": "是"
         }
 
 
